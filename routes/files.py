@@ -3,6 +3,7 @@ import json
 from os import path
 import os
 import shutil
+from datetime import datetime, timezone
 
 from ..utils import get_target_folder_files, get_parent_path, get_info_filename, \
     image_extensions, video_extensions
@@ -11,10 +12,55 @@ from ..utils import get_target_folder_files, get_parent_path, get_info_filename,
 async def api_get_files(request):
     folder_path = request.query.get('folder_path', '')
     folder_type = request.query.get('folder_type', 'outputs')
+
+    # New query params:
+    # sort_by: 'name' (default) or 'mtime'
+    # order: 'asc' (default) or 'desc'
+    sort_by = request.query.get('sort_by', 'name')
+    order = request.query.get('order', 'asc')
+    sort_by = sort_by if sort_by in ('name', 'mtime') else 'name'
+    order = order if order in ('asc', 'desc') else 'asc'
+    reverse = order == 'desc'
+
     files = get_target_folder_files(folder_path, folder_type=folder_type)
 
     if files == None:
         return web.Response(status=404)
+
+    # If client requested mtime sorting (or if you want to always return mtime),
+    # enrich file entries with 'mtime' (ISO 8601 UTC) so client can display it.
+    if sort_by == 'mtime':
+        parent_path = get_parent_path(folder_type)
+        for f in files:
+            try:
+                fp = path.join(parent_path, folder_path, f.get('name', ''))
+                if path.exists(fp):
+                    mtime_ts = os.path.getmtime(fp)
+                    f['mtime'] = datetime.fromtimestamp(mtime_ts, tz=timezone.utc).isoformat()
+                else:
+                    # file doesn't exist on disk (maybe removed) -> set to epoch
+                    f['mtime'] = datetime.fromtimestamp(0, tz=timezone.utc).isoformat()
+            except Exception:
+                # On error, fall back to epoch
+                f['mtime'] = datetime.fromtimestamp(0, tz=timezone.utc).isoformat()
+
+    # Sorting logic:
+    if sort_by == 'name':
+        # keep directories before files, then case-insensitive name sort
+        files.sort(key=lambda e: (not e.get('is_dir', False), e.get('name', '').lower()), reverse=reverse)
+    else:  # sort_by == 'mtime'
+        def _mtime_key(e):
+            v = e.get('mtime')
+            if not v:
+                # missing mtime => treat as very old
+                return datetime.fromtimestamp(0, tz=timezone.utc)
+            try:
+                return datetime.fromisoformat(v)
+            except Exception:
+                return datetime.fromtimestamp(0, tz=timezone.utc)
+        # If you prefer directories-first for mtime as well, you can return a tuple:
+        # files.sort(key=lambda e: (not e.get('is_dir', False), _mtime_key(e)), reverse=reverse)
+        files.sort(key=_mtime_key, reverse=reverse)
 
     return web.json_response({
         'files': files
@@ -87,6 +133,7 @@ async def api_update_file(request):
             json.dump(extra, outfile)
 
     return web.Response(status=201)
+
 
 # filename, folder_path, folder_type
 async def api_view_file(request):
